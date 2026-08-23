@@ -7,7 +7,12 @@ authors = [
     { name = "James", email = "drakkula-dev@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "alembic>=1.19.1",
+    "fastapi[standard]>=0.141.1",
+    "psycopg[binary]>=3.3.4",
+    "sqlalchemy>=2.0.52",
+]
 
 [project.scripts]
 docsense = "docsense:main"
