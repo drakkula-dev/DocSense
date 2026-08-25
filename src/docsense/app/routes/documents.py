@@ -26,3 +26,16 @@ def upload_file(
         "File Type": file_type,
         # TODO: Add extracted text here once process_document returns it.
     }
+
+
+# TODO: GET /{document_id} — retrieve one document's metadata + extracted
+# content. Requires persisting results somewhere first (DB/storage) —
+# nothing is saved yet, so there's nothing to fetch back.
+
+# TODO: GET / — list all uploaded documents, likely with pagination.
+
+# TODO: PUT/PATCH /{document_id} — update a document. Decide which: PUT
+# would mean re-uploading/replacing the whole document; PATCH would mean
+# updating a subset of fields (e.g. renaming, re-running extraction).
+
+# TODO: DELETE /{document_id} — remove a document and its stored file/results.

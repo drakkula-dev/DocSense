@@ -39,7 +39,6 @@ separated.
 ## 2. FastAPI Concepts
 
 ### `UploadFile`
-
 - It's an **object/wrapper**, not raw bytes.
 - Gives you: `.filename` (string, client-supplied, unverified), `.content_type`
   (string, client-supplied, unverified), and access to the actual bytes via
@@ -51,9 +50,7 @@ separated.
   implementation detail — you never get a real, usable path from it.
 
 ### Getting bytes out of `UploadFile`
-
 Two ways, pick one per route:
-
 ```python
 contents = await file.read()      # async method, route must be `async def`
 contents = file.file.read()       # sync method, route can be a normal `def`
@@ -264,6 +261,7 @@ braces *with* colons (`{"pdf": ...}`) would make it a dict.
 |---|---|---|
 | `Annotated` | `typing` (built-in) | Attaches extra metadata (like `File(...)`) to a type hint |
 | `Any` | `typing` (built-in) | Generic "could be anything" type hint |
+| `FastAPI` | `fastapi` | Creates the main application instance everything attaches to |
 | `APIRouter` | `fastapi` | Groups related routes together |
 | `UploadFile` | `fastapi` | Wrapper object representing an uploaded file |
 | `File` | `fastapi` | Marks a parameter as coming from multipart file data |
@@ -273,7 +271,79 @@ braces *with* colons (`{"pdf": ...}`) would make it a dict.
 
 ---
 
-## 11. Mental Model to Remember
+## 11. Composing the App — `main.py`
+
+Once you have multiple routers (health, documents, etc.), `main.py` is where
+they all get wired together into one running application.
+
+```python
+from fastapi import FastAPI
+
+from .routes.health import router as health_router
+from .routes.documents import router as file_router
+
+app = FastAPI()
+
+app.include_router(health_router)
+app.include_router(file_router, prefix="/files")
+```
+
+- **`FastAPI()`** — creates the single application instance that represents
+  your entire API. Everything else (routers, middleware, exception handlers)
+  attaches to this one object.
+- **`app.include_router(...)`** — registers a router's endpoints onto the
+  app. This is *why* splitting routes into separate files per resource
+  (`health.py`, `documents.py`, ...) works cleanly — each file defines its
+  own routes independently, and `main.py` just assembles them. No route
+  logic should live in `main.py` itself.
+- **`prefix="/files"`** — prepends a path segment to *every* route defined
+  in that router. The documents router defines its upload route as
+  `@router.post("/")`, but because it's included with `prefix="/files"`,
+  the real, live endpoint becomes `POST /files/`. This lets each router
+  define routes relative to its own resource (just `"/"`, `"/{id}"`, etc.)
+  without needing to know or repeat the full path itself.
+- **Scales cleanly** — adding a new resource later (e.g. users, auth) means
+  creating a new router file and adding one more `include_router()` line
+  here, not touching existing routes.
+
+---
+
+## 13. HTTP Methods & REST Conventions (CRUD)
+
+As routes expand beyond just uploading, each HTTP method maps to a
+conventional meaning. FastAPI doesn't enforce any of this — it's a
+convention you follow so your API behaves the way other developers expect.
+
+| Method | Meaning | Typical use here | Success status |
+|---|---|---|---|
+| `POST` | Create something new | Upload a new document | `201 Created` |
+| `GET` | Read/retrieve, no side effects | Fetch one document or list all | `200 OK` |
+| `PUT` | **Replace** a resource entirely | Re-upload a document, overwriting it | `200 OK` |
+| `PATCH` | Update **part** of a resource | Rename a document, re-trigger extraction | `200 OK` |
+| `DELETE` | Remove a resource | Delete a document and its data | `204 No Content` (or `200`) |
+
+**`PUT` vs `PATCH` — the distinction that trips people up:**
+- `PUT` implies you're sending the *entire* resource and it should fully
+  replace what's stored — anything you don't include is conceptually gone.
+- `PATCH` implies you're sending only the *fields that changed*, and
+  everything else stays as-is.
+
+For this project: uploading a brand-new version of a file to replace an old
+one → `PUT`. Just renaming a document or re-running extraction on the
+existing file → `PATCH`. Many small APIs only implement `PATCH` and skip
+`PUT` entirely if full replacement never really happens — that's a
+legitimate, common choice, not a shortcut.
+
+**Why none of GET/PUT/PATCH/DELETE can be built yet:**
+All four require something to look up, replace, or delete — which means a
+document needs to be **persisted** (saved to a database and/or file storage)
+first. Right now `process_document` runs entirely in memory and returns a
+result — nothing is saved anywhere yet. Persistence is the real prerequisite
+behind all four of these routes, not the routes themselves.
+
+---
+
+## 14. Mental Model to Remember
 
 ```
 Client uploads file
