@@ -1,373 +1,518 @@
-# Backend Learning Notes — Document Upload API
+# DocSense — Learning Notes
 
-Concepts, patterns, and gotchas learned while building the `/documents` upload
-route and `document_service.py`. Written to review and actually understand
-*why*, not just *what*.
-
----
-
-## 1. Architecture: Route vs. Service Separation
-
-**The core idea:** the route handles HTTP, the service handles business logic.
-Never mix the two.
-
-- **Route's job:** receive the request, pull out plain data, call the service,
-  catch errors, return a response. Nothing more.
-- **Service's job:** do the actual work (validate, extract, process). It
-  should have zero knowledge that HTTP even exists.
-
-**Why bother?**
-- The service becomes testable without faking a whole HTTP request.
-- The service becomes reusable — same function callable from a CLI script,
-  a background worker, another route, etc.
-- Bugs are easier to isolate: "is this an HTTP problem or a logic problem?"
-  becomes obvious from which file the code lives in.
-
-**The dependency only flows one way:**
-Route → imports from → Service.
-Service must **never** import from the route file, and should never import
-FastAPI-specific things (`UploadFile`, `Request`, `HTTPException`) at all.
-If your service file needs FastAPI to run, the separation isn't real yet.
-
-**Test for "is this actually separated?"**
-Could you copy `document_service.py` into a plain Python script (no FastAPI
-installed) and call `process_document()` with some bytes? If yes — properly
-separated.
+> An AI Document Intelligence API for extracting, formatting, summarizing, and analyzing document content.
+> Target users: HR managers, legal teams, researchers, anyone drowning in documents.
 
 ---
 
-## 2. FastAPI Concepts
+## 1. FastAPI Fundamentals
 
-### `UploadFile`
-- It's an **object/wrapper**, not raw bytes.
-- Gives you: `.filename` (string, client-supplied, unverified), `.content_type`
-  (string, client-supplied, unverified), and access to the actual bytes via
-  `.read()` (async) or `.file.read()` (sync).
-- FastAPI does **not** validate file type, size, or corruption for you.
-  It will accept literally any file, of any type — validation is 100% on you.
-- There is no meaningful filesystem "path" involved. FastAPI may spool large
-  uploads to a temp file internally for memory efficiency, but that's an
-  implementation detail — you never get a real, usable path from it.
+### 1.1 The App Instance
 
-### Getting bytes out of `UploadFile`
-Two ways, pick one per route:
 ```python
-contents = await file.read()      # async method, route must be `async def`
-contents = file.file.read()       # sync method, route can be a normal `def`
+from fastapi import FastAPI
+app = FastAPI()
 ```
-Either way, **this conversion has to happen before calling the service** —
-the service should only ever receive plain `bytes`, never the `UploadFile`
-object itself.
 
-### `File()` vs `Form()`
-Both read from `multipart/form-data` request bodies (the format used for
-file uploads, which can carry regular fields *and* files together).
-- `File()` → pulls out file content (often implicit when you type-hint
-  `UploadFile`).
-- `Form()` → pulls out regular text fields sent alongside the file (e.g. a
-  `"description"` field the user typed in).
+- **One app to rule them all.** Every router, middleware, and exception handler attaches to this single instance.
+- FastAPI auto-generates OpenAPI docs at `/docs` (Swagger UI) and `/redoc`.
 
-### Automatic validation FastAPI already does
-If a file parameter is required (no default value) and the client submits
-the request with no file attached at all, FastAPI/Starlette rejects it with
-a `422` **before your route function even runs**. You don't need to write
-code for this case.
+### 1.2 Routers (`APIRouter`)
 
-### Where the "Choose File" dialog comes from
-It's a **browser** feature (standard HTML file input), not FastAPI. By the
-time your server-side code runs, the file has already been picked client-side
-— your server only ever receives bytes + filename string + content-type
-string. It never has access to, or knowledge of, where the file lived on the
-user's computer.
+```python
+from fastapi import APIRouter
+router = APIRouter()
+
+@router.post("/")
+def upload_file(...): ...
+```
+
+- Routers group related endpoints (e.g., all `/documents` routes).
+- Keeps code modular — each domain gets its own file.
+- Mount routers with prefixes in `main.py`:
+
+  ```python
+  app.include_router(file_router, prefix="/files")
+  # Results in POST /files/
+  ```
+
+### 1.3 Status Codes
+
+```python
+from fastapi import status
+@router.post("/", status_code=status.HTTP_201_CREATED)
+```
+
+- Always return semantically correct status codes.
+- `201 Created` for successful resource creation.
+- `200 OK` for reads, `204 No Content` for successful deletes.
+
+### 1.4 File Uploads with `UploadFile`
+
+```python
+from fastapi import UploadFile, File
+from typing import Annotated
+
+@router.post("/")
+def upload_file(
+    file: Annotated[UploadFile, File(description="PDF, DOCX, TXT ONLY")]
+) -> dict[Any, Any]:
+    file_content = file.file.read()
+```
+
+- `Annotated[UploadFile, File(...)]` tells FastAPI to expect a **file upload**, not JSON.
+- `UploadFile` is a wrapper around a SpooledTemporaryFile — memory-efficient for large files.
+- `.file.read()` reads the uploaded file into raw `bytes`.
+- **Important:** `UploadFile` also gives you `.filename`, `.content_type`, `.size` (after reading).
+
+### 1.5 Type Hints with `Annotated`
+
+```python
+from typing import Annotated
+```
+
+- `Annotated` attaches metadata to types without changing the type itself.
+- Used here to attach `File()` metadata to `UploadFile`.
+- Makes the API schema self-documenting in `/docs`.
 
 ---
 
-## 3. `raise` vs `return` — the most important Python distinction here
+## 2. Python File Handling & Type Detection
 
-| | `return` | `raise` |
-|---|---|---|
-| What it does | Ends the *current function*, hands back a value | Ends the *current function* AND immediately jumps to the nearest matching `except`, skipping everything in between |
-| Can it be silently ignored? | Yes — caller must remember to check the value | No — it either gets caught explicitly, or propagates loudly (visible error, not a silent bad value) |
-| Good for | Normal success results | Signaling failure |
+### 2.1 Reading Files as Bytes
 
-**Rule of thumb used throughout this project:** any time `process_document`
-determines something is wrong (wrong file type, empty file, too large,
-extraction failed), it should **raise a custom exception** — never `return`
-`None`/a string/a dict pretending to be an error. A returned "error message"
-looks like a valid result to any caller that doesn't explicitly check for it,
-which risks silently sending a `200 OK` for a failed operation.
+```python
+file_content = file.file.read()  # Returns bytes
+```
 
-`raise` does **not** crash "the whole program" — only the current function
-stops, and control jumps to whatever catches it. If nothing catches it,
-FastAPI itself will turn it into a generic `500` response rather than
-literally crashing the server process.
+- Always process files as `bytes` first for type detection.
+- Never trust the file extension from `filename` — it's user-controlled and easily spoofed.
 
----
+### 2.2 Magic-Byte Detection with `filetype`
 
-## 4. Custom Exceptions
+```python
+import filetype
+file_kind = filetype.guess(file_bytes)
+```
 
-Define your own exception classes instead of reusing generic built-ins like
-`ValueError`.
+- `filetype.guess()` identifies files by their **magic bytes** (file signatures), not their names.
+- Returns an object with `.extension` and `.mime` if identified.
+- Returns `None` if the file type is unknown.
+- **Limitation:** Cannot detect plain text files (`.txt`) because they have no magic bytes.
+
+### 2.3 Detecting Plain Text Files
+
+```python
+def is_txt_file(file: bytes) -> bool:
+    try:
+        file.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+```
+
+- Plain text has no magic bytes, so we use a **UTF-8 decode test** as a heuristic.
+- If it decodes cleanly, we treat it as text.
+- **Caveat:** This is naive. A binary file could coincidentally be valid UTF-8. For production, consider also checking for control characters or using `chardet`.
+
+### 2.4 Custom Exceptions for File Processing
 
 ```python
 class UnsupportedFileType(Exception):
     pass
+
+class UnidentifiedFileType(Exception):
+    pass
 ```
 
-**Why not just use `ValueError`?**
-`ValueError` is too generic — if you `except ValueError:` in the route,
-you'd accidentally catch *any* unrelated `ValueError` raised anywhere inside
-the service (e.g. from a totally different bug), and mistakenly respond as
-if it were an unsupported-file-type error. A custom exception class can only
-ever mean the one specific thing you defined it for.
+- Define domain-specific exceptions for clean error handling.
+- These will be caught by a **global exception handler** (TODO) and converted to HTTP responses.
 
-**Pattern used in this project:**
-- `UnsupportedFileType` — file type identified, but not one you support.
-- `UnidentifiedFileType` — file type couldn't be identified at all.
-- (Planned) `EmptyFile`, `FileTooLarge`, `ExtractionFailed` — same pattern,
-  one exception per distinct failure reason.
+---
 
-**In the route:** catch each specific exception and map it to the correct
-HTTP status code. This mapping should live *only* in the route — the service
-never mentions status codes.
+## 3. Service Layer Architecture
+
+### 3.1 Separation of Concerns
+
+```
+routes/          # HTTP layer — parsing requests, returning responses
+services/        # Business logic — file processing, AI analysis
+models/          # Pydantic models — request/response validation
+repositories/    # Data access — DB queries, file storage
+```
+
+- Routes should be thin. Heavy lifting belongs in `services/`.
+- `process_document()` in the service layer handles type checking and (soon) text extraction.
+
+### 3.2 Why Not Trust the Extension?
 
 ```python
-except UnsupportedFileType as e:
-    raise HTTPException(status_code=415, detail=str(e))
+# BAD — trusting user input
+file_type = filename.split(".")[-1]
+
+# GOOD — inspecting actual bytes
+file_kind = filetype.guess(file_bytes)
 ```
 
----
-
-## 5. The Three Layers Where an Upload Request Can Fail
-
-1. **FastAPI itself** — file field missing entirely → automatic `422`,
-   no code needed, your route never runs.
-2. **The route** — the read step itself fails (dropped connection, I/O error
-   during `file.read()`) → wrap the read in its own `try/except`. This is
-   about *receiving* the file, unrelated to the file's contents.
-3. **The service (`process_document`)** — file arrived fine, but its
-   *content* is invalid (wrong type, empty, too large, extraction fails) →
-   raises custom exceptions, which the route catches and maps to status
-   codes.
+- A user can rename `virus.exe` to `resume.pdf`. The extension lies; bytes don't.
 
 ---
 
-## 6. File Type Validation
+## 4. Document Processing Pipeline (Planned)
 
-### Two layers of "what type is this file?"
-1. **Claimed type** (cheap, unverified) — the `content_type` header or the
-   filename's extension. Easy to get wrong or spoof; only useful as a quick
-   first filter.
-2. **Actual type** (authoritative) — determined by inspecting the real
-   bytes. This is the check that actually matters.
-
-### `filetype` library
-- Detects file type by reading **magic bytes** (a signature at the start of
-  the file), independent of filename or claimed content-type.
-- Reliable for binary formats like **PDF** and **DOCX** (DOCX is internally
-  a ZIP file with a specific structure — `filetype` handles that detection
-  for you).
-- **Cannot detect plain text.** There's no magic-byte signature for "text" —
-  it's just bytes that happen to be readable. `filetype.guess()` returns
-  `None` for text files, not `"txt"`.
-- Install via `uv add filetype`.
-- "Stub file not found" is just your **type checker** (mypy/Pyright)
-  complaining the library has no type hints published — harmless, doesn't
-  affect runtime. Safe to ignore or suppress per-import.
-
-### Detecting text files (the fallback, since `filetype` can't)
-Heuristic: try decoding the bytes as UTF-8. Success is treated as "probably
-text."
-```python
-def is_txt_file(file: bytes) -> bool:
-    try:
-        file.decode("utf-8")
-        return True
-    except UnicodeDecodeError:
-        return False
-```
-**Important caveat:** this is a heuristic, not a guarantee. Some binary data
-can coincidentally decode as valid UTF-8 (false positive). A stronger version
-checks for null bytes first (`\x00` almost never appears in real text):
-```python
-def is_txt_file(file: bytes) -> bool:
-    if b"\x00" in file:
-        return False
-    try:
-        file.decode("utf-8")
-        return True
-    except UnicodeDecodeError:
-        return False
-```
-
-### `pathlib`
-- For working with **file paths and filenames as strings** (e.g. pulling an
-  extension off a filename: `Path(filename).suffix`).
-- Does **not** inspect actual file content — it's reading a label, same
-  trust level as the `content_type` header, not authoritative.
-- Not useful here for anything beyond the cheap "claimed type" check, since
-  there's no real filesystem path involved at this stage (the file only
-  exists as in-memory bytes, never touches disk in this pipeline).
-
----
-
-## 7. Data Structures: Set vs. List vs. Dict
-
-Used for `ALLOWED_FILE_TYPES = {"pdf", "docx"}`.
-
-- **Set** — correct choice here. Use when you only need fast "is this value
-  in the collection?" checks, no key-value pairing, no meaningful order,
-  no duplicates. Membership check is ~O(1) (hash-based).
-- **List** — would technically work (`in` works on lists too), but
-  membership check is O(n) (checks one by one), and using a list implies
-  order/duplicates might matter, which they don't here.
-- **Dict** — wrong tool unless you need to associate each item with some
-  other value (a real key → value pairing). Forcing fake values just to use
-  a dict is a sign it's the wrong structure.
-
-`{"pdf", "docx"}` — curly braces with no colons — is set syntax. Curly
-braces *with* colons (`{"pdf": ...}`) would make it a dict.
-
----
-
-## 8. Code Comment Conventions Used
-
-- `# NOTE:` — explains *what* a piece of code does or *why* it's written
-  that way. Keep to one tight sentence, one line, when possible.
-- `# TODO:` — marks planned/future work not yet implemented.
-- If a comment can't be shortened to one line without losing meaning, that's
-  often a sign the code itself might benefit from a clearer name instead of
-  a longer comment.
-
----
-
-## 9. Quick Reference: Response Status Codes Used
-
-| Exception | Meaning | HTTP Status |
-|---|---|---|
-| (missing file field) | FastAPI auto-rejects | `422 Unprocessable Entity` |
-| `UnsupportedFileType` | Recognized type, not allowed | `415 Unsupported Media Type` |
-| `UnidentifiedFileType` | Can't tell what it is | `415 Unsupported Media Type` |
-| `EmptyFile` (planned) | Zero-byte upload | `422 Unprocessable Entity` |
-| `FileTooLarge` (planned) | Over size limit | `413 Payload Too Large` |
-| `ExtractionFailed` (planned) | Valid type, extraction broke | `422 Unprocessable Entity` |
-| Success | — | `201 Created` (this project uses 201 since a resource is created) |
-
----
-
-## 10. Imports Covered So Far
-
-| Import | From | What it's for |
-|---|---|---|
-| `Annotated` | `typing` (built-in) | Attaches extra metadata (like `File(...)`) to a type hint |
-| `Any` | `typing` (built-in) | Generic "could be anything" type hint |
-| `FastAPI` | `fastapi` | Creates the main application instance everything attaches to |
-| `APIRouter` | `fastapi` | Groups related routes together |
-| `UploadFile` | `fastapi` | Wrapper object representing an uploaded file |
-| `File` | `fastapi` | Marks a parameter as coming from multipart file data |
-| `status` | `fastapi` | Named HTTP status code constants (`status.HTTP_201_CREATED`) instead of magic numbers |
-| `HTTPException` | `fastapi` | Raised in the route to return a specific HTTP error response |
-| `filetype` | third-party (`uv add filetype`) | Detects real file type from magic bytes |
-
----
-
-## 11. Composing the App — `main.py`
-
-Once you have multiple routers (health, documents, etc.), `main.py` is where
-they all get wired together into one running application.
-
-```python
-from fastapi import FastAPI
-
-from .routes.health import router as health_router
-from .routes.documents import router as file_router
-
-app = FastAPI()
-
-app.include_router(health_router)
-app.include_router(file_router, prefix="/files")
-```
-
-- **`FastAPI()`** — creates the single application instance that represents
-  your entire API. Everything else (routers, middleware, exception handlers)
-  attaches to this one object.
-- **`app.include_router(...)`** — registers a router's endpoints onto the
-  app. This is *why* splitting routes into separate files per resource
-  (`health.py`, `documents.py`, ...) works cleanly — each file defines its
-  own routes independently, and `main.py` just assembles them. No route
-  logic should live in `main.py` itself.
-- **`prefix="/files"`** — prepends a path segment to *every* route defined
-  in that router. The documents router defines its upload route as
-  `@router.post("/")`, but because it's included with `prefix="/files"`,
-  the real, live endpoint becomes `POST /files/`. This lets each router
-  define routes relative to its own resource (just `"/"`, `"/{id}"`, etc.)
-  without needing to know or repeat the full path itself.
-- **Scales cleanly** — adding a new resource later (e.g. users, auth) means
-  creating a new router file and adding one more `include_router()` line
-  here, not touching existing routes.
-
----
-
-## 13. HTTP Methods & REST Conventions (CRUD)
-
-As routes expand beyond just uploading, each HTTP method maps to a
-conventional meaning. FastAPI doesn't enforce any of this — it's a
-convention you follow so your API behaves the way other developers expect.
-
-| Method | Meaning | Typical use here | Success status |
-|---|---|---|---|
-| `POST` | Create something new | Upload a new document | `201 Created` |
-| `GET` | Read/retrieve, no side effects | Fetch one document or list all | `200 OK` |
-| `PUT` | **Replace** a resource entirely | Re-upload a document, overwriting it | `200 OK` |
-| `PATCH` | Update **part** of a resource | Rename a document, re-trigger extraction | `200 OK` |
-| `DELETE` | Remove a resource | Delete a document and its data | `204 No Content` (or `200`) |
-
-**`PUT` vs `PATCH` — the distinction that trips people up:**
-- `PUT` implies you're sending the *entire* resource and it should fully
-  replace what's stored — anything you don't include is conceptually gone.
-- `PATCH` implies you're sending only the *fields that changed*, and
-  everything else stays as-is.
-
-For this project: uploading a brand-new version of a file to replace an old
-one → `PUT`. Just renaming a document or re-running extraction on the
-existing file → `PATCH`. Many small APIs only implement `PATCH` and skip
-`PUT` entirely if full replacement never really happens — that's a
-legitimate, common choice, not a shortcut.
-
-**Why none of GET/PUT/PATCH/DELETE can be built yet:**
-All four require something to look up, replace, or delete — which means a
-document needs to be **persisted** (saved to a database and/or file storage)
-first. Right now `process_document` runs entirely in memory and returns a
-result — nothing is saved anywhere yet. Persistence is the real prerequisite
-behind all four of these routes, not the routes themselves.
-
----
-
-## 14. Mental Model to Remember
+### 4.1 Current Flow
 
 ```
 Client uploads file
-        │
-        ▼
- FastAPI (auto-checks required field exists) ──► 422 if missing
-        │
-        ▼
-   Route: await file.read()  ──► try/except for read failures
-        │  (UploadFile → bytes)
-        ▼
-   Service: process_document(bytes, filename, content_type)
-        │
-        ├─ detect type (claimed hint + filetype magic-byte check)
-        ├─ raise UnsupportedFileType / UnidentifiedFileType if bad
-        ├─ (planned) check empty/size → raise EmptyFile / FileTooLarge
-        ├─ (planned) extract content → raise ExtractionFailed if it breaks
-        └─ return a plain result object
-        │
-        ▼
-   Route: catch exceptions → map to HTTP status
-          on success → return result as JSON
+    ↓
+FastAPI receives UploadFile
+    ↓
+Read raw bytes
+    ↓
+Detect file type (magic bytes → fallback UTF-8 test)
+    ↓
+Validate against ALLOWED_FILE_TYPES
+    ↓
+Return {filename, file_type}
 ```
 
-**The one rule that ties all of this together:** the service only ever deals
-in plain Python data (bytes, strings, custom exceptions) — never HTTP
-concepts. The route only ever deals in HTTP concerns — never business logic.
+### 4.2 Target Flow (DocSense v1)
+
+```
+Client uploads file
+    ↓
+FastAPI receives UploadFile
+    ↓
+Read raw bytes
+    ↓
+Detect & validate file type
+    ↓
+Extract text content (PDF → pdfplumber/pymupdf, DOCX → python-docx, TXT → decode)
+    ↓
+Store original file + extracted text (DB / object storage)
+    ↓
+Return {id, filename, file_type, extracted_text_preview}
+```
+
+### 4.3 Target Flow (DocSense v2 — AI Analysis)
+
+```
+Extracted text
+    ↓
+Chunk text (if large) + embed
+    ↓
+AI analysis pipeline:
+    • Summarization
+    • Entity extraction (names, dates, amounts, clauses)
+    • Insight generation ("This contract expires in 30 days")
+    • Comparison ("Diff between v1 and v2 of this policy")
+    ↓
+Return structured insights + raw text
+```
+
+---
+
+## 5. Text Extraction Strategies by File Type
+
+| File Type | Library | Approach |
+| ----------- | --------- | ---------- |
+| **PDF** | `pymupdf` (fitz) or `pdfplumber` | Extract text per page; handle scanned PDFs with OCR (`pytesseract` + `pdf2image`) |
+| **DOCX** | `python-docx` | Read paragraphs, tables, headers; preserve structure |
+| **TXT** | Native | `bytes.decode("utf-8")` with fallback to `chardet` for encoding detection |
+| **Images** | `pytesseract` + `Pillow` | OCR for text-in-images (receipts, scanned forms, screenshots) |
+
+### 5.1 Handling Scanned PDFs
+
+- Some PDFs are just images wrapped in a PDF container.
+- Strategy: If `pymupdf` returns empty text, convert pages to images and run OCR.
+- Libraries: `pdf2image` (poppler required) → `Pillow` → `pytesseract`.
+
+---
+
+## 6. AI Integration Architecture
+
+### 6.1 Use Cases for DocSense
+
+1. **Summarization** — "Give me a 3-bullet summary of this 20-page contract."
+2. **Entity Extraction** — "Find all dates, dollar amounts, and party names."
+3. **Compliance Check** — "Flag any clauses that don't match our standard template."
+4. **Q&A** — "What is the termination clause in this document?"
+5. **Comparison** — "What changed between offer letter v1 and v2?"
+6. **Insight Generation** — "This employee's contract has unusual non-compete terms."
+
+### 6.2 Implementation Patterns
+
+```python
+# Pattern 1: Direct LLM call
+from openai import AsyncOpenAI
+client = AsyncOpenAI()
+
+async def analyze_document(text: str, query: str) -> str:
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a document analysis assistant."},
+            {"role": "user", "content": f"Document:
+{text}
+
+Query: {query}"}
+        ]
+    )
+    return response.choices[0].message.content
+```
+
+```python
+# Pattern 2: Structured output (Pydantic)
+from pydantic import BaseModel
+
+class ContractInsights(BaseModel):
+    parties: list[str]
+    effective_date: str
+    key_clauses: list[str]
+    risks: list[str]
+    summary: str
+
+# Use OpenAI's structured outputs or function calling
+```
+
+### 6.3 Chunking for Large Documents
+
+- LLMs have context limits (e.g., 128k tokens for GPT-4o).
+- For large documents, chunk text intelligently:
+  - By page
+  - By paragraph
+  - By semantic similarity (embeddings)
+- Use **RAG** (Retrieval-Augmented Generation) for very large docs: chunk → embed → store in vector DB → retrieve relevant chunks for the query.
+
+---
+
+## 7. Error Handling & Resilience
+
+### 7.1 Global Exception Handler (TODO)
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(UnsupportedFileType)
+async def unsupported_file_handler(request: Request, exc: UnsupportedFileType):
+    return JSONResponse(
+        status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+        content={"error": "Unsupported file type", "detail": str(exc)}
+    )
+
+@app.exception_handler(UnidentifiedFileType)
+async def unidentified_file_handler(request: Request, exc: UnidentifiedFileType):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"error": "Could not identify file type", "detail": str(exc)}
+    )
+```
+
+- Catches unhandled service exceptions and returns clean, consistent error responses.
+- Prevents generic 500s from leaking internal details.
+
+### 7.2 Validation Errors
+
+- FastAPI auto-validates Pydantic models and returns `422 Unprocessable Entity`.
+- Custom validators can enforce business rules (e.g., max file size).
+
+---
+
+## 8. CORS & Security (TODO)
+
+### 8.1 CORS Middleware
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://your-frontend.com"],  # NOT "*" in production
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
+```
+
+- Add once the frontend origin is known.
+- Never use `allow_origins=["*"]` with `allow_credentials=True` — security risk.
+
+### 8.2 File Upload Security Checklist
+
+- [ ] Validate file type by magic bytes (done)
+- [ ] Enforce max file size (`Request` middleware or nginx)
+- [ ] Scan for malware (ClamAV or cloud-native scanner)
+- [ ] Store files outside web root (S3, local volume, not `/static`)
+- [ ] Sanitize filenames before storage
+- [ ] Rate limit uploads per user/IP
+
+---
+
+## 9. Data Persistence (TODO)
+
+### 9.1 What to Store
+
+| Field | Type | Purpose |
+| ------- | ------ | --------- |
+| `id` | UUID / auto-increment | Primary key |
+| `filename` | str | Original name |
+| `stored_path` | str | Path in storage (S3 key or local path) |
+| `file_type` | str | Detected type (pdf, docx, txt) |
+| `extracted_text` | text | Full extracted content |
+| `metadata` | JSON | Page count, word count, author, etc. |
+| `created_at` | datetime | Upload timestamp |
+| `updated_at` | datetime | Last modified |
+
+### 9.2 Storage Options
+
+- **Local filesystem**: Simple, but not scalable.
+- **AWS S3 / GCS / Azure Blob**: Scalable, durable, cheap. Use presigned URLs for downloads.
+- **Database (BLOB)**: Avoid for large files. Fine for small metadata.
+
+### 9.3 API Endpoints to Implement
+
+```
+POST   /files/              → Upload document
+GET    /files/              → List all documents (paginated)
+GET    /files/{id}          → Get document metadata + extracted text
+PUT    /files/{id}          → Replace document (full re-upload)
+PATCH  /files/{id}          → Update metadata (rename, re-extract)
+DELETE /files/{id}          → Remove document + stored file
+POST   /files/{id}/analyze  → Run AI analysis on document
+GET    /files/{id}/insights → Retrieve cached AI insights
+```
+
+---
+
+## 10. Async vs Sync
+
+### 10.1 When to Use `async`
+
+- **Use `async`** for I/O-bound operations: DB queries, HTTP calls to LLM APIs, file uploads to S3.
+- **Use sync** for CPU-bound operations: PDF text extraction, image OCR, heavy string processing.
+- FastAPI runs sync functions in a threadpool, so they don't block the event loop.
+
+### 10.2 Example
+
+```python
+# Sync — CPU-bound text extraction
+def process_document(file: bytes) -> str:
+    # pdfplumber, python-docx, etc.
+    return extracted_text
+
+# Async — I/O-bound AI call
+async def analyze_with_llm(text: str) -> str:
+    response = await openai_client.chat.completions.create(...)
+    return response.choices[0].message.content
+```
+
+---
+
+## 11. Testing Strategy
+
+### 11.1 Unit Tests
+
+- Test `process_document()` with sample files of each type.
+- Mock LLM calls in analysis tests (use `respx` or `pytest-httpx`).
+- Test edge cases: empty files, corrupted files, files with wrong extensions.
+
+### 11.2 Integration Tests
+
+- Use `TestClient` from FastAPI to hit endpoints.
+- Use `tmp_path` fixture for file operations.
+- Spin up a test DB (SQLite in-memory or Testcontainers for Postgres).
+
+```python
+from fastapi.testclient import TestClient
+client = TestClient(app)
+
+def test_upload_pdf():
+    with open("tests/fixtures/sample.pdf", "rb") as f:
+        response = client.post("/files/", files={"file": ("sample.pdf", f, "application/pdf")})
+    assert response.status_code == 201
+    assert response.json()["File Type"] == "pdf"
+```
+
+---
+
+## 12. Project Roadmap
+
+### Phase 1 — Foundation (Current)
+
+- [x] Basic FastAPI app with routers
+- [x] File upload endpoint
+- [x] File type detection by magic bytes
+- [ ] Global exception handler
+- [ ] CORS middleware
+- [ ] Text extraction (PDF, DOCX, TXT)
+- [ ] Persist documents (DB + storage)
+
+### Phase 2 — Core API
+
+- [ ] GET /files (paginated list)
+- [ ] GET /files/{id} (retrieve document)
+- [ ] DELETE /files/{id}
+- [ ] PUT/PATCH /files/{id}
+- [ ] File size limits and validation
+
+### Phase 3 — AI Intelligence
+
+- [ ] Integrate LLM (OpenAI / Anthropic / local model)
+- [ ] Summarization endpoint
+- [ ] Entity extraction endpoint
+- [ ] Q&A endpoint (chat with document)
+- [ ] Structured output (Pydantic schemas)
+
+### Phase 4 — Advanced Features
+
+- [ ] Image support (OCR for JPG/PNG)
+- [ ] Document comparison (diff)
+- [ ] Batch processing (upload multiple files)
+- [ ] Webhook notifications on processing complete
+- [ ] User authentication & API keys
+
+---
+
+## 13. Quick Reference Cheatsheet
+
+```python
+# FastAPI router with prefix
+app.include_router(router, prefix="/files", tags=["documents"])
+
+# Annotated file upload
+file: Annotated[UploadFile, File(description="...")]
+
+# Read uploaded file
+content = await file.read()  # async version
+content = file.file.read()   # sync version
+
+# Custom exception → HTTP response
+@app.exception_handler(MyException)
+async def handler(req, exc):
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+# Pydantic response model
+class UploadResponse(BaseModel):
+    id: str
+    filename: str
+    file_type: str
+    extracted_text: str | None = None
+```
+
+---
+
+## 14. Resources & References
+
+- **FastAPI Docs**: <https://fastapi.tiangolo.com/>
+- **Pydantic**: <https://docs.pydantic.dev/>
+- **`filetype`**: <https://github.com/h2non/filetype.py>
+- **`pymupdf` (fitz)**: <https://pymupdf.readthedocs.io/>
+- **`python-docx`**: <https://python-docx.readthedocs.io/>
+- **`pytesseract`**: <https://github.com/madmaze/pytesseract>
+- **OpenAI API**: <https://platform.openai.com/docs/>
+
+---
+
+*Last updated: 2026-08-27*
+*Project: DocSense — AI Document Intelligence API*
