@@ -1,4 +1,6 @@
 import filetype
+from docx import Document
+import io
 
 # NOTE: Raised when the file type is identified but not supported.
 class UnsupportedFileType(Exception):
@@ -22,7 +24,7 @@ def is_txt_file(file: bytes) -> bool:
 
 
 # TODO: Extract and return the file's text content, not just its type.
-def process_document(file: bytes):
+def check_file(file: bytes):
     # NOTE: filetype.guess() identifies the file from its actual bytes, not its name.
     file_kind = filetype.guess(file)
 
@@ -37,3 +39,20 @@ def process_document(file: bytes):
 
     else:
         raise UnidentifiedFileType("Can't identify file type")
+
+def extract_docx(docx_file: bytes) -> str:
+    document = Document(io.BytesIO(docx_file))
+    content = [para.text for para in document.paragraphs]
+
+    return '\n'.join(content)
+
+
+def process_file(file: bytes):
+    file_type = check_file(file)
+
+    if file_type == "docx":
+        text = extract_docx(file)
+    else:
+        return None
+
+    return {"type": file_type, "content": text}
