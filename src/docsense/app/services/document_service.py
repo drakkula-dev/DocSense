@@ -2,6 +2,7 @@ import filetype
 from docx import Document
 import io
 
+
 # NOTE: Raised when the file type is identified but not supported.
 class UnsupportedFileType(Exception):
     pass
