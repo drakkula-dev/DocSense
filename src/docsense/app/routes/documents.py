@@ -1,12 +1,19 @@
 from typing import Annotated
 from datetime import datetime, UTC
 import uuid
+from uuid import UUID
 
-from fastapi import APIRouter, status, UploadFile, File
+from fastapi import APIRouter, status, UploadFile, File, Depends
 
 from ..services.document_service import process_file
 
 from ..schemas.document import FileResponse
+
+from ..database.database import files_db
+
+from ..dependencies import get_id_or_404
+
+
 
 # NOTE: Groups related endpoints under one router, e.g. all "/documents" routes.
 router = APIRouter()
@@ -20,20 +27,23 @@ def upload_file(
     # NOTE: Reads the uploaded file into raw bytes for processing.
     file_bytes = file.file.read()
     result = process_file(file_bytes)
+    created_id = uuid.uuid4()
 
-    return FileResponse(
-        file_id=uuid.uuid4(),
+    response = FileResponse(
+        file_id=created_id,
         file_name=file.filename,
         file_type=result["type"],
         file_content=result["content"],
         created_at=datetime.now(UTC)
     )
 
+    files_db[created_id] = response
 
+    return response
 
-# TODO: GET /{document_id} — retrieve one document's metadata + extracted
-# content. Requires persisting results somewhere first (DB/storage) —
-# nothing is saved yet, so there's nothing to fetch back.
+@router.get("/{id}", response_model=FileResponse, status_code=status.HTTP_200_OK)
+def get_file_by_id(file: FileResponse = Depends(get_id_or_404)) -> FileResponse:
+    return file
 
 # TODO: GET / — list all uploaded documents, likely with pagination.
 
