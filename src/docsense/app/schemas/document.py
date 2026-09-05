@@ -7,5 +7,6 @@ class FileResponse(BaseModel):
     file_id: UUID
     file_name: str
     file_type: str
-    file_content: str
+    file_text_content: str
+    file_img_content: list[str]
     created_at: datetime
