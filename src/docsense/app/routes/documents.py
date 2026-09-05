@@ -65,7 +65,8 @@ def upload_file(
         file_id=created_id,
         file_name=file.filename,
         file_type=result["type"],
-        file_content=result["content"],
+        file_text_content=result["content"]["text"],
+        file_img_content=result["content"]["images"],
         created_at=datetime.now(UTC)
     )
 
@@ -90,7 +91,9 @@ def get_file_by_id(
 ) -> FileResponse:
     return file
 
-# TODO: GET / — list all uploaded documents, likely with pagination.
+@router.get("/", response_model=list[FileResponse], status_code=status.HTTP_200_OK)
+def list_files() -> list[FileResponse]:
+    return list(files_db.values())
 
 # TODO: PUT/PATCH /{document_id} — update a document. Decide which: PUT
 # would mean re-uploading/replacing the whole document; PATCH would mean
