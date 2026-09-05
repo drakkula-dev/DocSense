@@ -59,14 +59,30 @@ def extract_docx(docx_file: bytes) -> str:
     return docx_text
 
 
-def extract_pdf(pdf_file: bytes) -> str:
-    # NOTE: "with" ensures the underlying PDF resource is closed even if
-    # extraction fails partway through.
+def extract_pdf(pdf_file: bytes):
     with pymupdf.open(stream=pdf_file, filetype="pdf") as document:
-        content = [page.get_text() for page in document]
-        pdf_text = "".join(content).strip()
+        pdf_text = []
+        pdf_imgs = []
 
-    return pdf_text
+        for page_num, page in enumerate(document, start=1):
+            for img_index, img in enumerate(page.get_images(), start=1):
+                xref = img[0]
+                base_img = document.extract_image(xref)
+                img_bytes = base_img["image"]
+                img_ext = base_img["ext"]
+                img_path = f"page_{page_num}_image_{img_index}.{img_ext}"
+
+                with open (img_path, "wb") as f:
+                    f.write(img_bytes)
+
+                pdf_imgs.append(img_path)
+            pdf_text.append(page.get_text())
+
+        pdf_text = "".join(pdf_text).strip()
+            
+        content = {"text": pdf_text, "images": pdf_imgs}
+
+        return content
 
 
 def extract_txt(txt_file: bytes) -> str:
@@ -77,11 +93,14 @@ def extract_txt(txt_file: bytes) -> str:
 
 def process_file(file: bytes):
     file_type = check_file(file)
+    images = []
 
     if file_type == "docx":
         text = extract_docx(file)
     elif file_type == "pdf":
-        text = extract_pdf(file)
+        result = extract_pdf(file)
+        text = result["text"]
+        images = result["images"]
     elif file_type == "txt":
         text = extract_txt(file)
     else:
@@ -90,4 +109,4 @@ def process_file(file: bytes):
         # if a new type is added there without a matching extractor here.
         raise UnsupportedFileType(f"No extractor implemented for: {file_type}")
 
-    return {"type": file_type, "content": text}
+    return {"type": file_type, "content": {"text": text, "images": images}}
