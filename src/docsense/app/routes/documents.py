@@ -67,6 +67,7 @@ def upload_file(
         file_type=result["type"],
         file_text_content=result["content"]["text"],
         file_img_content=result["content"]["images"],
+        file_table_content=result["content"]["tables"],
         created_at=datetime.now(UTC)
     )
 
