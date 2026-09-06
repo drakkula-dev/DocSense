@@ -1,7 +1,9 @@
 import filetype
-from docx import Document
 import io
 import pymupdf
+from typing import Any
+
+from docx import Document
 
 
 # NOTE: Raised when we recognize the file type but don't support it (e.g. an .exe).
@@ -48,15 +50,24 @@ def check_file(file: bytes):
         raise UnidentifiedFileType("Can't identify file type")
 
 
-def extract_docx(docx_file: bytes) -> str:
-    # NOTE: python-docx only reads paragraph text; it won't pick up content in
-    # tables, headers/footers, or images.
+def extract_docx(docx_file: bytes):
     document = Document(io.BytesIO(docx_file))
-    content = [para.text for para in document.paragraphs]
+    
+    text = [para.text for para in document.paragraphs]
+    docx_text = "\n".join(text).strip()
 
-    docx_text = "\n".join(content).strip()
+    tables_data = []
+    for table in document.tables:
+        table_rows = []
+        for row in table.rows:
+            row_text = [cell.text for cell in row.cells]
+            table_rows.append(row_text)
+        tables_data.append({"rows": table_rows})
 
-    return docx_text
+    content: dict[str, Any] = {"text": docx_text, "tables": tables_data}
+
+    return content
+
 
 
 def extract_pdf(pdf_file: bytes):
@@ -78,9 +89,9 @@ def extract_pdf(pdf_file: bytes):
                 pdf_imgs.append(img_path)
             pdf_text.append(page.get_text())
 
-        pdf_text = "".join(pdf_text).strip()
+        pdf_text: str = "".join(pdf_text).strip()
             
-        content = {"text": pdf_text, "images": pdf_imgs}
+        content: dict[str, Any] = {"text": pdf_text, "images": pdf_imgs}
 
         return content
 
@@ -94,9 +105,12 @@ def extract_txt(txt_file: bytes) -> str:
 def process_file(file: bytes):
     file_type = check_file(file)
     images = []
+    tables = []
 
     if file_type == "docx":
-        text = extract_docx(file)
+        result = extract_docx(file)
+        text = result["text"]
+        tables = result["tables"]
     elif file_type == "pdf":
         result = extract_pdf(file)
         text = result["text"]
@@ -109,4 +123,4 @@ def process_file(file: bytes):
         # if a new type is added there without a matching extractor here.
         raise UnsupportedFileType(f"No extractor implemented for: {file_type}")
 
-    return {"type": file_type, "content": {"text": text, "images": images}}
+    return {"type": file_type, "content": {"text": text, "images": images, "tables": tables}}
