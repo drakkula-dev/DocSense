@@ -16,6 +16,6 @@ class FileResponse(BaseModel):
     created_at: datetime
 
 class FileUpdate(BaseModel):
-    file_name: Optional[str] = Field(default=None, min_length=1, json_schema_extra={"example": ""})
+    file_name: Optional[str] = Field(default=None, min_length=1)
 
     model_config = ConfigDict(extra='forbid')
