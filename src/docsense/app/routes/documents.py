@@ -18,7 +18,7 @@ from ..services.document_service import process_file
 # NOTE: The Pydantic model defining the *shape* of a document. Used as the
 # return type hint of these functions AND as FastAPI's response_model, which
 # controls what actually gets serialized back to the client.
-from ..schemas.document import FileResponse
+from ..schemas.document import FileResponse, FileUpdate
 
 # NOTE: The in-memory "database" — a plain dict standing in for real
 # persistence until Postgres is added later. Imported by reference, so every
@@ -96,8 +96,13 @@ def get_file_by_id(
 def list_files() -> list[FileResponse]:
     return list(files_db.values())
 
-# TODO: PUT/PATCH /{document_id} — update a document. Decide which: PUT
-# would mean re-uploading/replacing the whole document; PATCH would mean
-# updating a subset of fields (e.g. renaming, re-running extraction).
+@router.patch("/{id}", response_model=FileResponse, status_code=status.HTTP_200_OK)
+def update_file_metadata(file_update: FileUpdate, file: FileResponse = Depends(get_id_or_404)):
+    changes = file_update.model_dump(exclude_unset=True)
+    file_updated = file.model_copy(update=changes)
+
+    files_db[file.file_id] = file_updated
+    return file_updated
+    
 
 # TODO: DELETE /{document_id} — remove a document and its stored file/results.
